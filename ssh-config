@@ -1,0 +1,7 @@
+########
+# SSH hook to run utility to insert current IP address into Security Group
+
+Match host demo-bastion exec "/path/to/bastion-util"
+Host demo-bastion
+   User ubuntu
+   Hostname 328.1.1.1

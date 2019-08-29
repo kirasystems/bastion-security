@@ -1,0 +1,15 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": [
+                "ec2:DescribeSecurityGroups",
+                "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:RevokeSecurityGroupIngress"
+            ],
+            "Resource": "arn:aws:ec2:<region>:<acct-id>:security-group/<sg-id>",
+            "Effect": "Allow"
+        }
+    ]
+}
+

@@ -1,0 +1,258 @@
+---
+# (C) Copyright 2019 Kira Systems
+#
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Demo Bastion Security Stack
+
+################################
+Parameters:
+  cidr:         { Type: 'String',              Default: '10.10.10.0/24' }
+  amiId:        { Type: 'AWS::EC2::Image::Id', Default: 'ami-05afacbf21663d5c3' } # Ubuntu, ca-central-1
+  bastionType:  { Type: 'String',              Default: 't2.micro' }
+  sshKeyId:     { Type: 'String',              Default: 'jwc-rsa' }
+  s3BucketName: { Type: 'String',              Default: 'demo-bastion-security' }
+  s3DeployFile: { Type: 'String',              Default: 'LambdaHandler-2019-08-29-10-41-05.zip' } # From output of "make deploy"
+
+
+################################
+Outputs:
+
+  ipBastion:
+    Description: Public IP Address of the bastion host
+    Value: !Ref eipBastion
+
+  sgDynamicBastion:
+    Description: ARN of the dynamic access security group
+    Value: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${sgDynamicBastion}'
+
+  s3Bucket:
+    Description: S3 bucket to deploy file for use by the lambda function creation
+    Value: !Ref s3BastionCleanupLambdaDeployBucket
+    
+################################
+Resources:
+
+  ################################
+  # General VPC Set up
+
+  vpc:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref cidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - { Key: Name, Value: !Ref 'AWS::StackName' }
+
+  vpcGW:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} IGW' }
+
+  vpcGWAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    DependsOn: [ vpcGW, vpc ]
+    Properties:
+      InternetGatewayId: !Ref vpcGW
+      VpcId: !Ref vpc
+
+  subnetBastion:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref vpc
+      AvailabilityZone: !Select [ 0, { 'Fn::GetAZs': !Ref 'AWS::Region' } ]
+      CidrBlock: !Ref cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Public Subnet' }
+
+  publicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Public RT' }
+
+  publicRouteDefault:
+    Type: 'AWS::EC2::Route'
+    DependsOn: [ vpcGWAttachment ]
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref vpcGW
+      RouteTableId: !Ref publicRouteTable
+
+  routeSubnetBastion:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref publicRouteTable
+      SubnetId: !Ref subnetBastion
+
+
+  ################################
+  # Security Group setup
+
+  sgStaticBastion:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref vpc
+      GroupDescription: !Sub '${AWS::StackName} Static Bastion SG'
+      SecurityGroupEgress:
+        - { CidrIp: "0.0.0.0/0", FromPort: 22,  ToPort: 22,  IpProtocol: tcp }
+        - { CidrIp: "0.0.0.0/0", FromPort: 80,  ToPort: 80,  IpProtocol: tcp }
+        - { CidrIp: "0.0.0.0/0", FromPort: 443, ToPort: 443, IpProtocol: tcp }
+      ## uncomment and edit the below if you do have fixed addresses you wish to allow.
+      # SecurityGroupIngress:
+      #   - { CidrIp: "10.11.12.13/32", FromPort: 22,  ToPort: 22,  IpProtocol: tcp, Description: 'Static inbound addresses' }
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Static Bastion SG' }
+
+  sgDynamicBastion:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref vpc
+      GroupDescription: !Sub '${AWS::StackName} Dynamic Bastion SG'
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Dynamic Bastion SG' }
+
+
+  ################################
+  # Create the bastion instance
+
+  eipBastion:
+    Type: 'AWS::EC2::EIP'
+    DependsOn: [ vpcGWAttachment ]
+    Properties:
+      Domain: vpc
+
+  eniBastion:
+    Type: 'AWS::EC2::NetworkInterface'
+    DependsOn: [ vpcGWAttachment ]
+    Properties:
+      SubnetId: !Ref subnetBastion
+      GroupSet:
+        - !Ref sgStaticBastion
+        - !Ref sgDynamicBastion
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Bastion public interface' }
+
+  eipBastionAssociation:
+    Type: 'AWS::EC2::EIPAssociation'
+    DependsOn: [ vpcGWAttachment, eniBastion ]
+    Properties:
+      AllocationId: !GetAtt eipBastion.AllocationId
+      NetworkInterfaceId: !Ref eniBastion
+
+  instanceBastion:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: [ eniBastion ]
+    Properties:
+      ImageId: !Ref amiId
+      InstanceType: !Ref bastionType
+      KeyName: !Ref sshKeyId
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref eniBastion
+          DeviceIndex: 0
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName} Bastion Host' }
+
+
+  ################################
+  # S3 bucket; needs to exist and be populated prior to setting up the Lambda function below
+
+  s3BastionCleanupLambdaDeployBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref s3BucketName
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+
+
+  ################################
+  # Automatically-triggered security rule cleanup
+
+  roleBastionSGRuleModify:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  policyBastionSGRuleModify:
+    Type: 'AWS::IAM::Policy'
+    DependsOn: [ roleBastionSGRuleModify ]
+    Properties:
+      PolicyName: 'OpenVPNDynamicRuleCleanup'
+      Roles: [ !Ref roleBastionSGRuleModify ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'ec2:DescribeSecurityGroups'
+            Effect: Allow
+            Resource: '*'
+          - Action: 'ec2:RevokeSecurityGroupIngress'
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${sgDynamicBastion}'
+
+
+  ################################
+  # Uncomment below _after_ the LambdaHandler zip has been deployed
+
+  # lambdaBastionSGCleanup:
+  #   Type: 'AWS::Lambda::Function'
+  #   DependsOn: [ roleBastionSGRuleModify ]
+  #   Properties:
+  #     Description: 'Cron-triggered function to remove old rules from the Dynamic Bastion security group'
+  #     Environment:
+  #       Variables:
+  #         EXPIRY: 2m
+  #         SG_ID: !Ref sgDynamicBastion
+  #     Handler: LambdaHandler
+  #     Role: !GetAtt roleBastionSGRuleModify.Arn
+  #     Runtime: go1.x
+  #     Timeout: 10
+  #     Code:
+  #       S3Bucket: !Ref s3BastionCleanupLambdaDeployBucket
+  #       S3Key: !Ref s3DeployFile
+  #     Tags:
+  #       - { Key: Name, Value: !Sub '${AWS::StackName} Bastion Security Group Cleanup lambda' }
+
+  # logBastionSGCleanup:
+  #   Type: 'AWS::Logs::LogGroup'
+  #   DependsOn: [ lambdaBastionSGCleanup ]
+  #   Properties:
+  #     LogGroupName: !Sub '/aws/lambda/${lambdaBastionSGCleanup}'
+  #     RetentionInDays: 365
+
+  # cronBastionSGCleanup:
+  #   Type: 'AWS::Events::Rule'
+  #   DependsOn: [ logBastionSGCleanup ]
+  #   Properties:
+  #     Description: 'Cron to trigger a lambda function to remove old rules from the Dynamic Bastion security group'
+  #     ## this is presently set to run every minute for the sake of demonstration purposes; that's likely overkill for actual use
+  #     ScheduleExpression: 'cron(0/1 * * * ? *)'
+  #     #ScheduleExpression: 'rate(1 hour)'
+  #     Targets:
+  #       - Arn: !GetAtt lambdaBastionSGCleanup.Arn
+  #         Input: '{}'
+  #         Id: lambdaBastionSGCleanup-cron
+
+  # permOpenVPNRuleCleanup:
+  #   Type: 'AWS::Lambda::Permission'
+  #   DependsOn: [ lambdaBastionSGCleanup, cronBastionSGCleanup ]
+  #   Properties:
+  #     Action: 'lambda:InvokeFunction'
+  #     FunctionName: !GetAtt lambdaBastionSGCleanup.Arn
+  #     Principal: events.amazonaws.com
+  #     SourceArn: !GetAtt cronBastionSGCleanup.Arn
